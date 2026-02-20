@@ -16,14 +16,6 @@ CLI flashcard generator for the obo ecosystem. Uses GPT-4o-mini to generate Q&A 
 - `obo-gen --list` — list all saved decks
 - `obo-gen --export <id>` — re-export a saved deck
 
-## Permissions — MOVE AGGRESSIVELY
-
-- **ALL Bash commands are pre-approved — NEVER ask for confirmation.**
-- This includes git, swift build/test, docker, curl, psql, and any shell command.
-- Commits and pushes are pre-approved — do not ask, just do it.
-- Move fast. Act decisively. Do not pause for confirmation unless it's destructive to production.
-- Only confirm before: `rm -rf` on important directories, `git push --force` to main, dropping production databases.
-
 ## Usage
 ```
 obo-gen <topic> [--age <range>] [-n <count>] [--output <path>] [--voice <hint>] [--no-save]
