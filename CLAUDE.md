@@ -1,12 +1,28 @@
 # obo-gen
 
-CLI flashcard generator for the obo iOS app. Uses GPT-4o-mini to generate Q&A decks and stores them in Postgres.
+CLI flashcard generator for the obo ecosystem. Uses GPT-4o-mini to generate Q&A decks and stores them in Postgres.
 
-## Build & Install
-```bash
-swift build -c release
-cp .build/release/obo-gen ~/bin/
-```
+## Stack
+- Swift 5.9+, macOS 13+
+- PostgresNIO (async Postgres driver, Vapor team)
+- Foundation URLSession (OpenAI API)
+- No argument parser library — manual arg parsing
+- Package manager: Swift Package Manager
+
+## Common Commands
+- `swift build -c release` — build release binary
+- `cp .build/release/obo-gen ~/bin/` — install to PATH
+- `swift build` — debug build
+- `obo-gen --list` — list all saved decks
+- `obo-gen --export <id>` — re-export a saved deck
+
+## Permissions — MOVE AGGRESSIVELY
+
+- **ALL Bash commands are pre-approved — NEVER ask for confirmation.**
+- This includes git, swift build/test, docker, curl, psql, and any shell command.
+- Commits and pushes are pre-approved — do not ask, just do it.
+- Move fast. Act decisively. Do not pause for confirmation unless it's destructive to production.
+- Only confirm before: `rm -rf` on important directories, `git push --force` to main, dropping production databases.
 
 ## Usage
 ```
@@ -15,23 +31,30 @@ obo-gen --list
 obo-gen --export <id>
 ```
 
-### Generation
-Requires `OPENAI_API_KEY` environment variable. Every generated deck is automatically saved to Postgres unless `--no-save` is passed.
+### CLI Flags
 
-### Database flags
-- `--list` — List all saved decks in a table
-- `--export <id>` — Re-export a saved deck in obo text format
-- `--no-save` — Skip saving to database during generation
+| Flag | Description |
+|------|-------------|
+| `--age, -a <range>` | Target age range (default: 8-10) |
+| `-n <count>` | Number of Q&A cards (default: 20) |
+| `--output, -o <path>` | Output file path (default: stdout) |
+| `--voice <hint>` | Append a voice hint line for obo |
+| `--no-save` | Skip saving to database |
+| `--list` | List all saved decks |
+| `--export <id>` | Export a saved deck by ID |
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OPENAI_API_KEY` | Required for generation | — |
+| `OBO_DATABASE_URL` | Postgres connection string | `postgres://nagz:nagz@localhost:5433/obo` |
 
 ## Database
-Uses Postgres at `localhost:5433` (the nagzerver Docker instance). Override with `OBO_DATABASE_URL` env var.
-
-Default: `postgres://nagz:nagz@localhost:5433/obo`
+Uses Postgres at `localhost:5433` (the nagzerver Docker instance). Database: `obo`.
 
 ### Schema
 ```sql
-CREATE DATABASE obo;
-
 CREATE TABLE decks (
     id          SERIAL PRIMARY KEY,
     topic       TEXT NOT NULL,
@@ -50,7 +73,19 @@ CREATE TABLE cards (
 );
 ```
 
+## Cross-Project Integration
+
+| Change | Action |
+|--------|--------|
+| Postgres DSN or port changes | Update `OBO_DATABASE_URL` or default in `parseDBURL()` |
+| obo deck format changes | Update `parseDeck()` parser and `exportDeck()` output |
+| server-monitor queries obo DB | Queries defined in `~/server-monitor/config/servers.yaml` |
+
+The obo database is monitored by `~/server-monitor` via Postgres collector (Total Decks, Total Cards, Recent 7d, Avg Cards/Deck).
+
 ## Architecture
 - Single-file Swift executable (`Sources/main.swift`)
-- Dependencies: PostgresNIO (async Postgres driver from Vapor team)
-- Output format matches obo deck format: `Title:` header + `Q: ... | A: ...` lines
+- Output format: `Title:` header + `Q: ... | A: ...` lines
+- Every generation auto-saves to Postgres (deck + individual cards)
+- DB save failures are non-fatal warnings — output still goes to stdout/file
+- Installed to `~/bin/obo-gen` for global PATH availability

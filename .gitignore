@@ -1,0 +1,13 @@
+# Swift Package Manager
+.build/
+Packages/
+Package.pins
+Package.resolved
+*.xcodeproj/
+
+# OS
+.DS_Store
+*.swp
+
+# Environment
+.env
