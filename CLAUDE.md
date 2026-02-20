@@ -73,15 +73,23 @@ CREATE TABLE cards (
 );
 ```
 
-## Cross-Project Integration
+## Cross-Project Sync (OBO Ecosystem)
+
+The OBO ecosystem has three repos that must stay in sync:
+- `~/obo-server` — Python API server (reads from Postgres, serves decks)
+- `~/obo-gen` — this CLI generator (writes decks to Postgres)
+- `~/obo` — SwiftUI iOS app (consumes API)
+
+**After any schema change (decks/cards tables):**
+1. Update `~/obo-server` endpoints if response shape is affected
+2. Update `~/obo` iOS models in `Models.swift` if fields change
 
 | Change | Action |
 |--------|--------|
 | Postgres DSN or port changes | Update `OBO_DATABASE_URL` or default in `parseDBURL()` |
-| obo deck format changes | Update `parseDeck()` parser and `exportDeck()` output |
-| server-monitor queries obo DB | Queries defined in `~/server-monitor/config/servers.yaml` |
-
-The obo database is monitored by `~/server-monitor` via Postgres collector (Total Decks, Total Cards, Recent 7d, Avg Cards/Deck).
+| Deck format changes | Update `parseDeck()` parser and `exportDeck()` output |
+| Table schema changes | Update obo-server + obo iOS models |
+| server-monitor | OBO Server card polls `http://127.0.0.1:9810/metrics` |
 
 ## Architecture
 - Single-file Swift executable (`Sources/main.swift`)
