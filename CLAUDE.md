@@ -78,11 +78,13 @@ CREATE TABLE cards (
 The OBO ecosystem has three repos that must stay in sync:
 - `~/obo-server` — Python API server (reads from Postgres, serves decks)
 - `~/obo-gen` — this CLI generator (writes decks to Postgres)
-- `~/obo` — SwiftUI iOS app (consumes API)
+- `~/obo-ios` — SwiftUI iOS app (consumes API)
+
+Hub repo: `~/obo` (docs/planning only, no code)
 
 **After any schema change (decks/cards tables):**
 1. Update `~/obo-server` endpoints if response shape is affected
-2. Update `~/obo` iOS models in `Models.swift` if fields change
+2. Update `~/obo-ios` models in `Models.swift` if fields change
 
 | Change | Action |
 |--------|--------|
