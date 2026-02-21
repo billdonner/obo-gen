@@ -40,10 +40,14 @@ obo-gen --export <id>
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | Required for generation | — |
-| `OBO_DATABASE_URL` | Postgres connection string | `postgres://nagz:nagz@localhost:5433/obo` |
+| `OBO_DB_HOST` | Postgres host | `localhost` |
+| `OBO_DB_PORT` | Postgres port | `5432` |
+| `OBO_DB_USER` | Postgres username | `postgres` |
+| `OBO_DB_PASSWORD` | Postgres password | `postgres` |
+| `OBO_DB_NAME` | Postgres database name | `obo` |
 
 ## Database
-Uses Postgres at `localhost:5433` (the nagzerver Docker instance). Database: `obo`.
+Uses Postgres (configurable via environment variables, defaults to localhost:5432). Database: `obo`.
 
 ### Schema
 ```sql
@@ -80,7 +84,7 @@ Hub repo: `~/obo` (docs/planning only, no code)
 
 | Change | Action |
 |--------|--------|
-| Postgres DSN or port changes | Update `OBO_DATABASE_URL` or default in `parseDBURL()` |
+| Postgres host/port/credentials change | Update `OBO_DB_*` env vars or defaults in `loadDBConfig()` |
 | Deck format changes | Update `parseDeck()` parser and `exportDeck()` output |
 | Table schema changes | Update obo-server + obo iOS models |
 | server-monitor | OBO Server card polls `http://127.0.0.1:9810/metrics` |
@@ -90,4 +94,6 @@ Hub repo: `~/obo` (docs/planning only, no code)
 - Output format: `Title:` header + `Q: ... | A: ...` lines
 - Every generation auto-saves to Postgres (deck + individual cards)
 - DB save failures are non-fatal warnings — output still goes to stdout/file
+- All SQL queries use PostgresNIO parameterized bindings (no string-interpolated SQL)
+- DB connection has retry logic: 3 attempts with exponential backoff (1s, 2s, 4s)
 - Installed to `~/bin/obo-gen` for global PATH availability

@@ -46,9 +46,15 @@ func printUsage() -> Never {
       obo-gen --export 3
 
     Requires OPENAI_API_KEY environment variable (for generation).
-    Uses OBO_DATABASE_URL or defaults to postgres://nagz:nagz@localhost:5433/obo
+
+    Database environment variables:
+      OBO_DB_HOST       (default: localhost)
+      OBO_DB_PORT       (default: 5432)
+      OBO_DB_USER       (default: postgres)
+      OBO_DB_PASSWORD   (default: postgres)
+      OBO_DB_NAME       (default: obo)
     """, stderr)
-    exit(1)
+    exit(0)
 }
 
 func parseArgs() -> Config {
@@ -266,24 +272,16 @@ struct DBConfig {
     let database: String
 }
 
-func parseDBURL() -> DBConfig {
-    let urlStr = ProcessInfo.processInfo.environment["OBO_DATABASE_URL"]
-        ?? "postgres://nagz:nagz@localhost:5433/obo"
-
-    // Parse: postgres://user:pass@host:port/dbname
-    guard let url = URL(string: urlStr) else {
-        fputs("Error: invalid OBO_DATABASE_URL\n", stderr)
-        exit(1)
-    }
-
-    let host = url.host ?? "localhost"
-    let port = url.port ?? 5433
-    let username = url.user ?? "nagz"
-    let password = url.password ?? "nagz"
-    let database = String(url.path.dropFirst()) // remove leading /
+func loadDBConfig() -> DBConfig {
+    let env = ProcessInfo.processInfo.environment
+    let host = env["OBO_DB_HOST"] ?? "localhost"
+    let port = Int(env["OBO_DB_PORT"] ?? "") ?? 5432
+    let username = env["OBO_DB_USER"] ?? "postgres"
+    let password = env["OBO_DB_PASSWORD"] ?? "postgres"
+    let database = env["OBO_DB_NAME"] ?? "obo"
 
     return DBConfig(host: host, port: port, username: username, password: password,
-                    database: database.isEmpty ? "obo" : database)
+                    database: database)
 }
 
 func makeConnection(dbConfig: DBConfig, eventLoop: any EventLoopGroup) async throws -> PostgresConnection {
@@ -299,24 +297,38 @@ func makeConnection(dbConfig: DBConfig, eventLoop: any EventLoopGroup) async thr
         tls: .disable
     )
 
-    return try await PostgresConnection.connect(
-        on: eventLoop.next(),
-        configuration: config,
-        id: 1,
-        logger: logger
-    )
+    // Retry up to 3 times with exponential backoff (1s, 2s, 4s)
+    let maxAttempts = 3
+    var lastError: Error?
+
+    for attempt in 1...maxAttempts {
+        do {
+            return try await PostgresConnection.connect(
+                on: eventLoop.next(),
+                configuration: config,
+                id: 1,
+                logger: logger
+            )
+        } catch {
+            lastError = error
+            if attempt < maxAttempts {
+                let delaySeconds = UInt64(1 << (attempt - 1)) // 1, 2, 4
+                fputs("DB connection attempt \(attempt)/\(maxAttempts) failed, retrying in \(delaySeconds)s...\n", stderr)
+                try await Task.sleep(nanoseconds: delaySeconds * 1_000_000_000)
+            }
+        }
+    }
+
+    throw lastError!
 }
 
 func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, config: Config) async throws -> Int {
-    // Insert deck row
-    let deckRows = try await conn.query(
-        """
-        INSERT INTO decks (topic, age_range, voice, card_count)
-        VALUES (\(parsed.title), \(config.age), \(config.voice as String?), \(parsed.cards.count))
-        RETURNING id
-        """,
-        logger: Logger(label: "obo-gen")
-    )
+    let logger = Logger(label: "obo-gen")
+
+    // Insert deck row — parameterized via PostgresQuery bindings ($1..$4)
+    let insertDeckQuery: PostgresQuery =
+        "INSERT INTO decks (topic, age_range, voice, card_count) VALUES (\(parsed.title), \(config.age), \(config.voice as String?), \(parsed.cards.count)) RETURNING id"
+    let deckRows = try await conn.query(insertDeckQuery, logger: logger)
 
     var deckId = 0
     for try await row in deckRows {
@@ -327,25 +339,20 @@ func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, config: Config) asyn
         throw NSError(domain: "obo-gen", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to insert deck"])
     }
 
-    // Insert card rows
+    // Insert card rows — parameterized via PostgresQuery bindings ($1..$4)
     for (i, card) in parsed.cards.enumerated() {
-        try await conn.query(
-            """
-            INSERT INTO cards (deck_id, position, question, answer)
-            VALUES (\(deckId), \(i + 1), \(card.question), \(card.answer))
-            """,
-            logger: Logger(label: "obo-gen")
-        )
+        let insertCardQuery: PostgresQuery =
+            "INSERT INTO cards (deck_id, position, question, answer) VALUES (\(deckId), \(i + 1), \(card.question), \(card.answer))"
+        try await conn.query(insertCardQuery, logger: logger)
     }
 
     return deckId
 }
 
 func listDecks(conn: PostgresConnection) async throws {
-    let rows = try await conn.query(
-        "SELECT id, topic, age_range, card_count, created_at::text FROM decks ORDER BY id",
-        logger: Logger(label: "obo-gen")
-    )
+    let logger = Logger(label: "obo-gen")
+    let listQuery: PostgresQuery = "SELECT id, topic, age_range, card_count, created_at::text FROM decks ORDER BY id"
+    let rows = try await conn.query(listQuery, logger: logger)
 
     var decks: [(Int, String, String, Int, String)] = []
     for try await row in rows {
@@ -374,11 +381,11 @@ func listDecks(conn: PostgresConnection) async throws {
 }
 
 func exportDeck(conn: PostgresConnection, deckId: Int) async throws {
-    // Fetch deck
-    let deckRows = try await conn.query(
-        "SELECT topic, age_range, voice FROM decks WHERE id = \(deckId)",
-        logger: Logger(label: "obo-gen")
-    )
+    let logger = Logger(label: "obo-gen")
+
+    // Fetch deck — parameterized via PostgresQuery binding ($1)
+    let fetchDeckQuery: PostgresQuery = "SELECT topic, age_range, voice FROM decks WHERE id = \(deckId)"
+    let deckRows = try await conn.query(fetchDeckQuery, logger: logger)
 
     var topic = ""
     var voice: String? = nil
@@ -395,11 +402,9 @@ func exportDeck(conn: PostgresConnection, deckId: Int) async throws {
         exit(1)
     }
 
-    // Fetch cards
-    let cardRows = try await conn.query(
-        "SELECT question, answer FROM cards WHERE deck_id = \(deckId) ORDER BY position",
-        logger: Logger(label: "obo-gen")
-    )
+    // Fetch cards — parameterized via PostgresQuery binding ($1)
+    let fetchCardsQuery: PostgresQuery = "SELECT question, answer FROM cards WHERE deck_id = \(deckId) ORDER BY position"
+    let cardRows = try await conn.query(fetchCardsQuery, logger: logger)
 
     var output = "Title: \(topic)\n\n"
     for try await row in cardRows {
@@ -417,7 +422,7 @@ func exportDeck(conn: PostgresConnection, deckId: Int) async throws {
 // MARK: - DB Connection Helper
 
 func withDB<T: Sendable>(_ body: @Sendable (PostgresConnection) async throws -> T) async throws -> T {
-    let dbConfig = parseDBURL()
+    let dbConfig = loadDBConfig()
     let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let conn = try await makeConnection(dbConfig: dbConfig, eventLoop: eventLoopGroup)
     let result: T
