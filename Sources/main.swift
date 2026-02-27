@@ -9,7 +9,7 @@ import NIOPosix
 enum Mode {
     case generate
     case list
-    case export(Int)
+    case export(String)
 }
 
 struct Config {
@@ -35,7 +35,7 @@ func printUsage() -> Never {
       --voice <hint>        Append a voice hint line for obo
       --no-save             Skip saving to database
       --list                List all saved decks
-      --export <id>         Export a saved deck by ID
+      --export <id>         Export a saved deck by UUID (or prefix)
       --help, -h            Show this help
 
     Examples:
@@ -43,16 +43,16 @@ func printUsage() -> Never {
       obo-gen "US Presidents"
       obo-gen "Basic French Vocabulary" -n 30
       obo-gen --list
-      obo-gen --export 3
+      obo-gen --export a3b2c1d4
 
     Requires OPENAI_API_KEY environment variable (for generation).
 
-    Database environment variables:
-      OBO_DB_HOST       (default: localhost)
-      OBO_DB_PORT       (default: 5432)
-      OBO_DB_USER       (default: postgres)
-      OBO_DB_PASSWORD   (default: postgres)
-      OBO_DB_NAME       (default: obo)
+    Database environment variables (CE_DB_* preferred, OBO_DB_* fallback):
+      CE_DB_HOST        (default: localhost)
+      CE_DB_PORT        (default: 5432)
+      CE_DB_USER        (default: postgres)
+      CE_DB_PASSWORD    (default: postgres)
+      CE_DB_NAME        (default: card_engine)
     """, stderr)
     exit(0)
 }
@@ -74,11 +74,11 @@ func parseArgs() -> Config {
             config.mode = .list
         case "--export":
             i += 1
-            guard i < args.count, let id = Int(args[i]), id > 0 else {
-                fputs("Error: --export requires a positive integer deck ID\n", stderr)
+            guard i < args.count, !args[i].isEmpty else {
+                fputs("Error: --export requires a deck ID (UUID or prefix)\n", stderr)
                 exit(1)
             }
-            config.mode = .export(id)
+            config.mode = .export(args[i])
         case "--no-save":
             config.noSave = true
         case "--age", "-a":
@@ -274,11 +274,12 @@ struct DBConfig {
 
 func loadDBConfig() -> DBConfig {
     let env = ProcessInfo.processInfo.environment
-    let host = env["OBO_DB_HOST"] ?? "localhost"
-    let port = Int(env["OBO_DB_PORT"] ?? "") ?? 5432
-    let username = env["OBO_DB_USER"] ?? "postgres"
-    let password = env["OBO_DB_PASSWORD"] ?? "postgres"
-    let database = env["OBO_DB_NAME"] ?? "obo"
+    // Prefer CE_DB_* (card-engine), fall back to OBO_DB_* (legacy)
+    let host = env["CE_DB_HOST"] ?? env["OBO_DB_HOST"] ?? "localhost"
+    let port = Int(env["CE_DB_PORT"] ?? env["OBO_DB_PORT"] ?? "") ?? 5432
+    let username = env["CE_DB_USER"] ?? env["OBO_DB_USER"] ?? "postgres"
+    let password = env["CE_DB_PASSWORD"] ?? env["OBO_DB_PASSWORD"] ?? "postgres"
+    let database = env["CE_DB_NAME"] ?? env["OBO_DB_NAME"] ?? "card_engine"
 
     return DBConfig(host: host, port: port, username: username, password: password,
                     database: database)
@@ -322,27 +323,37 @@ func makeConnection(dbConfig: DBConfig, eventLoop: any EventLoopGroup) async thr
     throw lastError!
 }
 
-func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, config: Config) async throws -> Int {
+func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, config: Config) async throws -> String {
     let logger = Logger(label: "obo-gen")
 
-    // Insert deck row — parameterized via PostgresQuery bindings ($1..$4)
+    // Build JSONB properties: {"age_range": "8-10", "voice": "..."}
+    var propsDict: [String: String] = ["age_range": config.age]
+    if let voice = config.voice {
+        propsDict["voice"] = voice
+    }
+    let propsData = try JSONSerialization.data(withJSONObject: propsDict)
+    let propsJSON = String(data: propsData, encoding: .utf8) ?? "{}"
+
+    // Insert deck row — card-engine schema: UUID id, title, kind, properties JSONB
     let insertDeckQuery: PostgresQuery =
-        "INSERT INTO decks (topic, age_range, voice, card_count) VALUES (\(parsed.title), \(config.age), \(config.voice as String?), \(parsed.cards.count)) RETURNING id"
+        "INSERT INTO decks (title, kind, properties) VALUES (\(parsed.title), 'flashcard', \(propsJSON)::jsonb) RETURNING id::text"
     let deckRows = try await conn.query(insertDeckQuery, logger: logger)
 
-    var deckId = 0
+    var deckId = ""
     for try await row in deckRows {
-        (deckId) = try row.decode(Int.self)
+        (deckId) = try row.decode(String.self)
     }
 
-    guard deckId > 0 else {
+    guard !deckId.isEmpty else {
         throw NSError(domain: "obo-gen", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to insert deck"])
     }
 
-    // Insert card rows — parameterized via PostgresQuery bindings ($1..$4)
+    // Insert card rows — answer goes into properties JSONB
     for (i, card) in parsed.cards.enumerated() {
+        let cardPropsData = try JSONSerialization.data(withJSONObject: ["answer": card.answer])
+        let cardPropsJSON = String(data: cardPropsData, encoding: .utf8) ?? "{}"
         let insertCardQuery: PostgresQuery =
-            "INSERT INTO cards (deck_id, position, question, answer) VALUES (\(deckId), \(i + 1), \(card.question), \(card.answer))"
+            "INSERT INTO cards (deck_id, position, question, properties) VALUES (\(deckId)::uuid, \(i + 1), \(card.question), \(cardPropsJSON)::jsonb)"
         try await conn.query(insertCardQuery, logger: logger)
     }
 
@@ -351,17 +362,20 @@ func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, config: Config) asyn
 
 func listDecks(conn: PostgresConnection) async throws {
     let logger = Logger(label: "obo-gen")
-    let listQuery: PostgresQuery = "SELECT id, topic, age_range, card_count, created_at::text FROM decks ORDER BY id"
+    let listQuery: PostgresQuery = """
+        SELECT id::text, title, COALESCE(properties->>'age_range', ''), card_count, created_at::text
+        FROM decks WHERE kind = 'flashcard' ORDER BY created_at
+        """
     let rows = try await conn.query(listQuery, logger: logger)
 
-    var decks: [(Int, String, String, Int, String)] = []
+    var decks: [(String, String, String, Int, String)] = []
     for try await row in rows {
-        let (id, topic, ageRange, cardCount, createdAt) = try row.decode((Int, String, String, Int, String).self)
-        decks.append((id, topic, ageRange, cardCount, createdAt))
+        let (id, title, ageRange, cardCount, createdAt) = try row.decode((String, String, String, Int, String).self)
+        decks.append((id, title, ageRange, cardCount, createdAt))
     }
 
     if decks.isEmpty {
-        print("No saved decks.")
+        print("No saved flashcard decks.")
         return
     }
 
@@ -372,41 +386,46 @@ func listDecks(conn: PostgresConnection) async throws {
     func rpad(_ s: String, _ width: Int) -> String {
         s.count >= width ? String(s.prefix(width)) : String(repeating: " ", count: width - s.count) + s
     }
-    print("\(pad("ID", 4))  \(pad("Topic", 30))  \(pad("Ages", 8))  \(rpad("Cards", 5))  \(pad("Created", 20))")
-    print(String(repeating: "-", count: 75))
+    print("\(pad("ID", 36))  \(pad("Topic", 30))  \(pad("Ages", 8))  \(rpad("Cards", 5))  \(pad("Created", 20))")
+    print(String(repeating: "-", count: 107))
     for (id, topic, age, count, date) in decks {
         let truncTopic = topic.count > 30 ? String(topic.prefix(27)) + "..." : topic
-        print("\(pad(String(id), 4))  \(pad(truncTopic, 30))  \(pad(age, 8))  \(rpad(String(count), 5))  \(pad(date, 20))")
+        let shortId = String(id.prefix(8))
+        print("\(pad(shortId, 36))  \(pad(truncTopic, 30))  \(pad(age, 8))  \(rpad(String(count), 5))  \(pad(date, 20))")
     }
 }
 
-func exportDeck(conn: PostgresConnection, deckId: Int) async throws {
+func exportDeck(conn: PostgresConnection, deckIdPrefix: String) async throws {
     let logger = Logger(label: "obo-gen")
 
-    // Fetch deck — parameterized via PostgresQuery binding ($1)
-    let fetchDeckQuery: PostgresQuery = "SELECT topic, age_range, voice FROM decks WHERE id = \(deckId)"
+    // Support UUID prefix matching (e.g. "a3b2" matches "a3b2c1d4-...")
+    let fetchDeckQuery: PostgresQuery =
+        "SELECT id::text, title, properties->>'voice' FROM decks WHERE kind = 'flashcard' AND id::text LIKE \(deckIdPrefix + "%") LIMIT 1"
     let deckRows = try await conn.query(fetchDeckQuery, logger: logger)
 
-    var topic = ""
+    var deckId = ""
+    var title = ""
     var voice: String? = nil
     var found = false
     for try await row in deckRows {
         let row_data = try row.decode((String, String, String?).self)
-        topic = row_data.0
+        deckId = row_data.0
+        title = row_data.1
         voice = row_data.2
         found = true
     }
 
     guard found else {
-        fputs("Error: deck \(deckId) not found\n", stderr)
+        fputs("Error: no flashcard deck matching '\(deckIdPrefix)' found\n", stderr)
         exit(1)
     }
 
-    // Fetch cards — parameterized via PostgresQuery binding ($1)
-    let fetchCardsQuery: PostgresQuery = "SELECT question, answer FROM cards WHERE deck_id = \(deckId) ORDER BY position"
+    // Fetch cards — answer is in properties JSONB
+    let fetchCardsQuery: PostgresQuery =
+        "SELECT question, COALESCE(properties->>'answer', '') FROM cards WHERE deck_id = \(deckId)::uuid ORDER BY position"
     let cardRows = try await conn.query(fetchCardsQuery, logger: logger)
 
-    var output = "Title: \(topic)\n\n"
+    var output = "Title: \(title)\n\n"
     for try await row in cardRows {
         let (q, a) = try row.decode((String, String).self)
         output += "Q: \(q) | A: \(a)\n"
@@ -453,9 +472,9 @@ Task {
                 try await listDecks(conn: conn)
             }
 
-        case .export(let id):
+        case .export(let idPrefix):
             try await withDB { conn in
-                try await exportDeck(conn: conn, deckId: id)
+                try await exportDeck(conn: conn, deckIdPrefix: idPrefix)
             }
 
         case .generate:
