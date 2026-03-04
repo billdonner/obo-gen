@@ -1,4 +1,5 @@
 import Foundation
+import FoundationModels
 import ArgumentParser
 
 // MARK: - Shared Types
@@ -17,6 +18,7 @@ enum Difficulty: String, CaseIterable, ExpressibleByArgument {
 enum AIModel: String, CaseIterable, ExpressibleByArgument {
     case gpt = "gpt"
     case claude = "claude"
+    case onboard = "onboard"
 }
 
 struct Card {
@@ -278,6 +280,16 @@ func callClaude(systemPrompt: String, userPrompt: String, apiKey: String) async 
     return text
 }
 
+func callOnboard(systemPrompt: String, userPrompt: String) async throws -> String {
+    let model = SystemLanguageModel.default
+    guard model.isAvailable else {
+        throw OboGenError.apiError("On-device model not available (Apple Intelligence must be enabled)")
+    }
+    let session = LanguageModelSession(instructions: Instructions(systemPrompt))
+    let response = try await session.respond(to: Prompt(userPrompt))
+    return response.content
+}
+
 func callAI(model: AIModel, systemPrompt: String, userPrompt: String) async throws -> String {
     let env = ProcessInfo.processInfo.environment
     switch model {
@@ -291,6 +303,8 @@ func callAI(model: AIModel, systemPrompt: String, userPrompt: String) async thro
             throw OboGenError.missingKey("ANTHROPIC_API_KEY")
         }
         return try await callClaude(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: key)
+    case .onboard:
+        return try await callOnboard(systemPrompt: systemPrompt, userPrompt: userPrompt)
     }
 }
 
@@ -408,9 +422,20 @@ func buildCardDicts(cards: [Card], kind: CardKind, difficulty: Difficulty?) -> [
     }
 }
 
+// MARK: - Formatting Helpers
+
+func pad(_ s: String, _ w: Int) -> String {
+    s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
+}
+
+func rpad(_ s: String, _ w: Int) -> String {
+    s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
+}
+
 // MARK: - CLI Commands
 
-struct OboGen: ParsableCommand {
+@main
+struct OboGen: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "obo-gen",
         abstract: "Generate flashcard and trivia decks for the cardzerver ecosystem",
@@ -419,7 +444,7 @@ struct OboGen: ParsableCommand {
     )
 }
 
-struct Generate: ParsableCommand {
+struct Generate: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Generate a deck from an AI model")
 
     @Argument(help: "Topic for the deck (e.g. \"Solar System\")")
@@ -434,7 +459,7 @@ struct Generate: ParsableCommand {
     @Option(name: [.short, .long], help: "Kind of deck: flashcard or trivia (default: flashcard)")
     var kind: CardKind = .flashcard
 
-    @Option(name: [.short, .long], help: "AI model: gpt or claude (default: gpt)")
+    @Option(name: [.short, .long], help: "AI model: gpt, claude, or onboard (default: gpt)")
     var model: AIModel = .gpt
 
     @Option(name: .shortAndLong, help: "Output file path (default: stdout)")
@@ -452,19 +477,7 @@ struct Generate: ParsableCommand {
     @Flag(help: "Create even if a deck with the same title exists")
     var force: Bool = false
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do { try await runAsync() }
-            catch { fputs("Error: \(error.localizedDescription)\n", stderr); exitCode = 1 }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
-    }
-
-    func runAsync() async throws {
+    func run() async throws {
         let client = CardzerverClient()
 
         // Duplicate check
@@ -525,222 +538,159 @@ struct Generate: ParsableCommand {
     }
 }
 
-struct List: ParsableCommand {
+struct List: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "List all saved decks")
 
     @Option(name: [.short, .long], help: "Filter by kind: flashcard or trivia")
     var kind: CardKind? = nil
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do {
-                let client = CardzerverClient()
-                let decks = try await client.listDecks(kind: kind)
+    func run() async throws {
+        let client = CardzerverClient()
+        let decks = try await client.listDecks(kind: kind)
 
-                if decks.isEmpty {
-                    print("No saved decks.")
-                    semaphore.signal()
-                    return
-                }
-
-                func pad(_ s: String, _ w: Int) -> String {
-                    s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
-                }
-                func rpad(_ s: String, _ w: Int) -> String {
-                    s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
-                }
-                print("\(pad("ID", 10))  \(pad("Kind", 10))  \(pad("Topic", 30))  \(rpad("Cards", 5))  \(pad("Created", 20))")
-                print(String(repeating: "-", count: 81))
-                for deck in decks {
-                    let id = (deck["id"] as? String) ?? "?"
-                    let title = (deck["title"] as? String) ?? "?"
-                    let kind = (deck["kind"] as? String) ?? "?"
-                    let cardCount = (deck["card_count"] as? Int) ?? 0
-                    let created = (deck["created_at"] as? String) ?? "?"
-                    let shortId = String(id.prefix(8))
-                    let truncTitle = title.count > 30 ? String(title.prefix(27)) + "..." : title
-                    let shortDate = String(created.prefix(16))
-                    print("\(pad(shortId, 10))  \(pad(kind, 10))  \(pad(truncTitle, 30))  \(rpad(String(cardCount), 5))  \(pad(shortDate, 20))")
-                }
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
-            }
-            semaphore.signal()
+        if decks.isEmpty {
+            print("No saved decks.")
+            return
         }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
+
+        print("\(pad("ID", 10))  \(pad("Kind", 10))  \(pad("Topic", 30))  \(rpad("Cards", 5))  \(pad("Created", 20))")
+        print(String(repeating: "-", count: 81))
+        for deck in decks {
+            let id = (deck["id"] as? String) ?? "?"
+            let title = (deck["title"] as? String) ?? "?"
+            let dkind = (deck["kind"] as? String) ?? "?"
+            let cardCount = (deck["card_count"] as? Int) ?? 0
+            let created = (deck["created_at"] as? String) ?? "?"
+            let shortId = String(id.prefix(8))
+            let truncTitle = title.count > 30 ? String(title.prefix(27)) + "..." : title
+            let shortDate = String(created.prefix(16))
+            print("\(pad(shortId, 10))  \(pad(dkind, 10))  \(pad(truncTitle, 30))  \(rpad(String(cardCount), 5))  \(pad(shortDate, 20))")
+        }
     }
 }
 
-struct Export: ParsableCommand {
+struct Export: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Export a saved deck by UUID or prefix")
 
     @Argument(help: "Deck UUID or prefix")
     var id: String
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do {
-                let client = CardzerverClient()
+    func run() async throws {
+        let client = CardzerverClient()
 
-                // If prefix, find the full ID first
-                var fullId = id
-                if id.count < 36 {
-                    let decks = try await client.listDecks(kind: nil)
-                    guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
-                        throw OboGenError.notFound("No deck matching '\(id)'")
-                    }
-                    fullId = match["id"] as? String ?? id
-                }
-
-                let deck = try await client.getDeck(id: fullId)
-                let title = deck["title"] as? String ?? "Untitled"
-                let kind = deck["kind"] as? String ?? "flashcard"
-                let cards = deck["cards"] as? [[String: Any]] ?? []
-
-                var output = "Title: \(title)\nKind: \(kind)\n\n"
-
-                if kind == "trivia" {
-                    for card in cards {
-                        let q = card["question"] as? String ?? ""
-                        let props = card["properties"] as? [String: Any] ?? [:]
-                        output += "Q: \(q)\n"
-                        if let choices = props["choices"] as? [String],
-                           let correct = props["correct_index"] as? Int {
-                            let letters = ["A", "B", "C", "D"]
-                            for (i, choice) in choices.enumerated() {
-                                output += "\(letters[i])) \(choice)\n"
-                            }
-                            if correct < letters.count {
-                                output += "ANSWER: \(letters[correct])\n"
-                            }
-                        }
-                        output += "\n"
-                    }
-                } else {
-                    for card in cards {
-                        let q = card["question"] as? String ?? ""
-                        let props = card["properties"] as? [String: Any] ?? [:]
-                        let a = props["answer"] as? String ?? ""
-                        output += "Q: \(q) | A: \(a)\n"
-                    }
-                }
-
-                let deckProps = deck["properties"] as? [String: Any] ?? [:]
-                if let voice = deckProps["voice"] as? String {
-                    output += "\nVoice: \(voice)\n"
-                }
-                print(output, terminator: "")
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
+        // If prefix, find the full ID first
+        var fullId = id
+        if id.count < 36 {
+            let decks = try await client.listDecks(kind: nil)
+            guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
+                throw OboGenError.notFound("No deck matching '\(id)'")
             }
-            semaphore.signal()
+            fullId = match["id"] as? String ?? id
         }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
+
+        let deck = try await client.getDeck(id: fullId)
+        let title = deck["title"] as? String ?? "Untitled"
+        let dkind = deck["kind"] as? String ?? "flashcard"
+        let cards = deck["cards"] as? [[String: Any]] ?? []
+
+        var output = "Title: \(title)\nKind: \(dkind)\n\n"
+
+        if dkind == "trivia" {
+            for card in cards {
+                let q = card["question"] as? String ?? ""
+                let props = card["properties"] as? [String: Any] ?? [:]
+                output += "Q: \(q)\n"
+                if let choices = props["choices"] as? [String],
+                   let correct = props["correct_index"] as? Int {
+                    let letters = ["A", "B", "C", "D"]
+                    for (i, choice) in choices.enumerated() {
+                        output += "\(letters[i])) \(choice)\n"
+                    }
+                    if correct < letters.count {
+                        output += "ANSWER: \(letters[correct])\n"
+                    }
+                }
+                output += "\n"
+            }
+        } else {
+            for card in cards {
+                let q = card["question"] as? String ?? ""
+                let props = card["properties"] as? [String: Any] ?? [:]
+                let a = props["answer"] as? String ?? ""
+                output += "Q: \(q) | A: \(a)\n"
+            }
+        }
+
+        let deckProps = deck["properties"] as? [String: Any] ?? [:]
+        if let voice = deckProps["voice"] as? String {
+            output += "\nVoice: \(voice)\n"
+        }
+        print(output, terminator: "")
     }
 }
 
-struct Delete: ParsableCommand {
+struct Delete: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Delete a deck and its cards")
 
     @Argument(help: "Deck UUID or prefix")
     var id: String
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do {
-                let client = CardzerverClient()
+    func run() async throws {
+        let client = CardzerverClient()
 
-                // Resolve prefix
-                var fullId = id
-                var title = "?"
-                if id.count < 36 {
-                    let decks = try await client.listDecks(kind: nil)
-                    guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
-                        throw OboGenError.notFound("No deck matching '\(id)'")
-                    }
-                    fullId = match["id"] as? String ?? id
-                    title = match["title"] as? String ?? "?"
-                }
-
-                try await client.deleteDeck(id: fullId)
-                print("Deleted deck '\(title)' (\(String(fullId.prefix(8))))")
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
+        var fullId = id
+        var title = "?"
+        if id.count < 36 {
+            let decks = try await client.listDecks(kind: nil)
+            guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
+                throw OboGenError.notFound("No deck matching '\(id)'")
             }
-            semaphore.signal()
+            fullId = match["id"] as? String ?? id
+            title = match["title"] as? String ?? "?"
         }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
+
+        try await client.deleteDeck(id: fullId)
+        print("Deleted deck '\(title)' (\(String(fullId.prefix(8))))")
     }
 }
 
-struct Stats: ParsableCommand {
+struct Stats: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Show database statistics")
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do {
-                let client = CardzerverClient()
-                let stats = try await client.stats()
+    func run() async throws {
+        let client = CardzerverClient()
+        let stats = try await client.stats()
 
-                let totalDecks = stats["total_decks"] as? Int ?? 0
-                let totalCards = stats["total_cards"] as? Int ?? 0
+        let totalDecks = stats["total_decks"] as? Int ?? 0
+        let totalCards = stats["total_cards"] as? Int ?? 0
 
-                print("Server: \(client.baseURL)")
-                print("Total: \(totalDecks) decks, \(totalCards) cards\n")
+        print("Server: \(client.baseURL)")
+        print("Total: \(totalDecks) decks, \(totalCards) cards\n")
 
-                func pad(_ s: String, _ w: Int) -> String {
-                    s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
-                }
-                func rpad(_ s: String, _ w: Int) -> String {
-                    s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
-                }
-
-                if let byKind = stats["by_kind"] as? [[String: Any]], !byKind.isEmpty {
-                    print("\(pad("Kind", 12))  \(rpad("Decks", 6))  \(rpad("Cards", 6))")
-                    print(String(repeating: "-", count: 28))
-                    for entry in byKind {
-                        let kind = entry["kind"] as? String ?? "?"
-                        let decks = entry["decks"] as? Int ?? 0
-                        let cards = entry["cards"] as? Int ?? 0
-                        print("\(pad(kind, 12))  \(rpad(String(decks), 6))  \(rpad(String(cards), 6))")
-                    }
-                }
-
-                if let byAge = stats["by_age_range"] as? [[String: Any]], !byAge.isEmpty {
-                    print("\n\(pad("Age Range", 12))  \(rpad("Decks", 6))")
-                    print(String(repeating: "-", count: 20))
-                    for entry in byAge {
-                        let age = entry["age_range"] as? String ?? "?"
-                        let decks = entry["decks"] as? Int ?? 0
-                        print("\(pad(age, 12))  \(rpad(String(decks), 6))")
-                    }
-                }
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
+        if let byKind = stats["by_kind"] as? [[String: Any]], !byKind.isEmpty {
+            print("\(pad("Kind", 12))  \(rpad("Decks", 6))  \(rpad("Cards", 6))")
+            print(String(repeating: "-", count: 28))
+            for entry in byKind {
+                let kind = entry["kind"] as? String ?? "?"
+                let decks = entry["decks"] as? Int ?? 0
+                let cards = entry["cards"] as? Int ?? 0
+                print("\(pad(kind, 12))  \(rpad(String(decks), 6))  \(rpad(String(cards), 6))")
             }
-            semaphore.signal()
         }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
+
+        if let byAge = stats["by_age_range"] as? [[String: Any]], !byAge.isEmpty {
+            print("\n\(pad("Age Range", 12))  \(rpad("Decks", 6))")
+            print(String(repeating: "-", count: 20))
+            for entry in byAge {
+                let age = entry["age_range"] as? String ?? "?"
+                let decks = entry["decks"] as? Int ?? 0
+                print("\(pad(age, 12))  \(rpad(String(decks), 6))")
+            }
+        }
     }
 }
 
-struct Batch: ParsableCommand {
+struct Batch: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Generate decks from a topics file (one topic per line)")
 
     @Argument(help: "Path to topics file (one topic per line)")
@@ -755,7 +705,7 @@ struct Batch: ParsableCommand {
     @Option(name: [.short, .long], help: "Kind: flashcard or trivia (default: flashcard)")
     var kind: CardKind = .flashcard
 
-    @Option(name: [.short, .long], help: "AI model: gpt or claude (default: gpt)")
+    @Option(name: [.short, .long], help: "AI model: gpt, claude, or onboard (default: gpt)")
     var model: AIModel = .gpt
 
     @Option(name: .shortAndLong, help: "Difficulty level: easy, medium, hard")
@@ -767,19 +717,7 @@ struct Batch: ParsableCommand {
     @Flag(help: "Skip saving to cardzerver (generate + print only)")
     var noSave: Bool = false
 
-    func run() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var exitCode: Int32 = 0
-        Task {
-            do { try await runAsync() }
-            catch { fputs("Error: \(error.localizedDescription)\n", stderr); exitCode = 1 }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        if exitCode != 0 { Foundation.exit(exitCode) }
-    }
-
-    func runAsync() async throws {
+    func run() async throws {
         let expandedPath = NSString(string: file).expandingTildeInPath
         let content = try String(contentsOfFile: expandedPath, encoding: .utf8)
         let topics = content.components(separatedBy: "\n")
@@ -855,5 +793,3 @@ struct Batch: ParsableCommand {
         fputs("\nBatch complete: \(succeeded) created, \(skipped) skipped, \(failed) failed\n", stderr)
     }
 }
-
-OboGen.main()
