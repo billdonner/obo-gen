@@ -1,99 +1,143 @@
 # obo-gen
 
-CLI flashcard generator for the obo ecosystem. Uses GPT-4o-mini to generate Q&A decks and stores them in Postgres.
+CLI content generator for the cardzerver ecosystem. Uses GPT-4o-mini or Claude Haiku to generate flashcard and trivia decks, storing them in Postgres.
 
 ## Stack
 - Swift 5.9+, macOS 13+
 - PostgresNIO (async Postgres driver, Vapor team)
-- Foundation URLSession (OpenAI API)
-- No argument parser library — manual arg parsing
+- swift-argument-parser (CLI subcommands)
+- Foundation URLSession (OpenAI + Anthropic APIs)
 - Package manager: Swift Package Manager
 
 ## Common Commands
 - `swift build -c release` — build release binary
 - `cp .build/release/obo-gen ~/bin/` — install to PATH
 - `swift build` — debug build
-- `obo-gen --list` — list all saved decks
-- `obo-gen --export <id>` — re-export a saved deck
 
 ## Usage
+
 ```
-obo-gen <topic> [--age <range>] [-n <count>] [--output <path>] [--voice <hint>] [--no-save]
-obo-gen --list
-obo-gen --export <id>
+obo-gen generate <topic> [options]     # Generate a deck (default subcommand)
+obo-gen list [--kind <kind>]           # List all saved decks
+obo-gen export <id>                    # Export a deck by UUID or prefix
+obo-gen delete <id>                    # Delete a deck and its cards
+obo-gen stats                          # Show database statistics
+obo-gen batch <file> [options]         # Bulk generate from topics file
 ```
 
-### CLI Flags
+### Generate Options
 
-| Flag | Description |
-|------|-------------|
-| `--age, -a <range>` | Target age range (default: 8-10) |
-| `-n <count>` | Number of Q&A cards (default: 20) |
-| `--output, -o <path>` | Output file path (default: stdout) |
-| `--voice <hint>` | Append a voice hint line for obo |
-| `--no-save` | Skip saving to database |
-| `--list` | List all saved decks |
-| `--export <id>` | Export a saved deck by ID |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-a, --age <range>` | Target age range | `8-10` |
+| `-n, --count <N>` | Number of cards | `20` |
+| `-k, --kind <kind>` | `flashcard` or `trivia` | `flashcard` |
+| `-m, --model <model>` | `gpt` (GPT-4o-mini) or `claude` (Haiku 4.5) | `gpt` |
+| `-d, --difficulty <level>` | `easy`, `medium`, or `hard` | unset |
+| `-o, --output <path>` | Output file path | stdout |
+| `--voice <hint>` | Append voice hint line | — |
+| `--no-save` | Skip saving to database | `false` |
+| `--force` | Create even if duplicate title exists | `false` |
+
+### Examples
+
+```bash
+# Flashcard deck via GPT (default)
+obo-gen "Solar System" -n 30 --age 6-8
+
+# Trivia deck via Claude Haiku
+obo-gen "US Presidents" -n 20 --kind trivia --model claude
+
+# Hard difficulty, save to file only
+obo-gen "Quantum Physics" --difficulty hard --no-save -o ~/decks/quantum.txt
+
+# Batch generate from file
+echo "Solar System\nUS Presidents\nAncient Rome" > topics.txt
+obo-gen batch topics.txt --kind trivia --model claude -n 15
+
+# Database operations
+obo-gen list                    # All decks
+obo-gen list --kind trivia      # Only trivia
+obo-gen stats                   # Deck/card counts
+obo-gen export a3b2c1d4         # Export by ID prefix
+obo-gen delete a3b2c1d4         # Delete by ID prefix
+```
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENAI_API_KEY` | Required for generation | — |
-| `OBO_DB_HOST` | Postgres host | `localhost` |
-| `OBO_DB_PORT` | Postgres port | `5432` |
-| `OBO_DB_USER` | Postgres username | `postgres` |
-| `OBO_DB_PASSWORD` | Postgres password | `postgres` |
-| `OBO_DB_NAME` | Postgres database name | `obo` |
+| `OPENAI_API_KEY` | Required for `--model gpt` | — |
+| `ANTHROPIC_API_KEY` | Required for `--model claude` | — |
+| `CE_DB_HOST` | Postgres host | `localhost` |
+| `CE_DB_PORT` | Postgres port | `5432` |
+| `CE_DB_USER` | Postgres username | `postgres` |
+| `CE_DB_PASSWORD` | Postgres password | `postgres` |
+| `CE_DB_NAME` | Postgres database name | `card_engine` |
+
+Legacy `OBO_DB_*` env vars are still supported as fallbacks.
 
 ## Database
-Uses Postgres (configurable via environment variables, defaults to localhost:5432). Database: `obo`.
 
-### Schema
+Uses the cardzerver Postgres database (`card_engine`). Writes to the unified `decks` + `cards` tables with UUID primary keys and JSONB `properties`.
+
+### Schema (cardzerver unified)
 ```sql
+-- Decks: kind = 'flashcard' or 'trivia'
 CREATE TABLE decks (
-    id          SERIAL PRIMARY KEY,
-    topic       TEXT NOT NULL,
-    age_range   TEXT NOT NULL,
-    voice       TEXT,
-    card_count  INTEGER NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title      TEXT NOT NULL,
+    kind       card_kind NOT NULL,
+    properties JSONB NOT NULL DEFAULT '{}',
+    card_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Cards: question + properties JSONB
 CREATE TABLE cards (
-    id          SERIAL PRIMARY KEY,
-    deck_id     INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
-    position    INTEGER NOT NULL,
-    question    TEXT NOT NULL,
-    answer      TEXT NOT NULL
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    deck_id    UUID NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    question   TEXT NOT NULL,
+    properties JSONB NOT NULL DEFAULT '{}'
 );
 ```
 
-## Cross-Project Sync (OBO Ecosystem)
+### Card Properties by Kind
 
-The OBO ecosystem has three repos that must stay in sync:
-- `~/obo-server` — Python API server (reads from Postgres, serves decks)
-- `~/obo-gen` — this CLI generator (writes decks to Postgres)
-- `~/obo-ios` — SwiftUI iOS app (consumes API)
+| Kind | Properties JSONB fields |
+|------|------------------------|
+| `flashcard` | `answer`, optionally `difficulty` |
+| `trivia` | `answer`, `choices` (array), `correct` (int 0-3), optionally `difficulty` |
 
-Hub repo: `~/obo` (docs/planning only, no code)
+## Features
 
-**After any schema change (decks/cards tables):**
-1. Update `~/obo-server` endpoints if response shape is affected
-2. Update `~/obo-ios` models in `Models.swift` if fields change
+- **Duplicate detection**: Warns if a deck with the same title+kind exists (use `--force` to override)
+- **Batch mode**: Generate many decks from a topics file (one per line, `#` comments supported)
+- **Difficulty tagging**: `--difficulty easy/medium/hard` stored in deck + card properties
+- **Two AI models**: GPT-4o-mini (fast, cheap) and Claude Haiku 4.5 (alternative)
+- **DB save failures are non-fatal**: Output still goes to stdout/file
+
+## Cross-Project Sync (cardzerver ecosystem)
+
+- `~/cardzerver` — Unified FastAPI backend (serves decks via API), port 9810
+- `~/obo-gen` — This CLI generator (writes decks to cardzerver Postgres)
+- `~/obo-ios` — SwiftUI iOS flashcard app (consumes `/api/v1/flashcards`)
+- `~/alities-mobile` — SwiftUI iOS trivia app (consumes `/api/v1/trivia`)
+- `~/qross` — SwiftUI iOS trivia game (consumes `/api/v1/trivia/gamedata`)
+- `~/cardz-studio` — React web UI for content management (port 9850)
 
 | Change | Action |
 |--------|--------|
-| Postgres host/port/credentials change | Update `OBO_DB_*` env vars or defaults in `loadDBConfig()` |
-| Deck format changes | Update `parseDeck()` parser and `exportDeck()` output |
-| Table schema changes | Update obo-server + obo iOS models |
-| server-monitor | OBO Server card polls `http://127.0.0.1:9810/metrics` |
+| Postgres host/port/credentials change | Update `CE_DB_*` env vars |
+| Card properties schema changes | Update cardzerver adapters + iOS models |
+| New card kind added | Add prompt builder + parser in main.swift |
 
 ## Architecture
 - Single-file Swift executable (`Sources/main.swift`)
-- Output format: `Title:` header + `Q: ... | A: ...` lines
-- Every generation auto-saves to Postgres (deck + individual cards)
-- DB save failures are non-fatal warnings — output still goes to stdout/file
-- All SQL queries use PostgresNIO parameterized bindings (no string-interpolated SQL)
-- DB connection has retry logic: 3 attempts with exponential backoff (1s, 2s, 4s)
+- ArgumentParser subcommands: generate, list, export, delete, stats, batch
+- Flashcard format: `Title:` header + `Q: ... | A: ...` lines
+- Trivia format: `Title:` header + `Q:` + `A-D)` choices + `ANSWER:` letter
+- DB writes use PostgresNIO parameterized bindings (no string interpolation)
+- DB connection has retry logic: 3 attempts with exponential backoff
 - Installed to `~/bin/obo-gen` for global PATH availability
