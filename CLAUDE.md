@@ -105,7 +105,7 @@ obo-gen delete a3b2c1d4         # Delete by ID prefix
 - **Batch mode**: Generate many decks from a topics file (one per line, `#` comments supported)
 - **Difficulty tagging**: `--difficulty easy/medium/hard` stored in deck + card properties
 - **Three AI models**: GPT-4o-mini (cloud), Claude Haiku 4.5 (cloud), Apple Intelligence (free, on-device)
-- **API-first**: All DB operations go through cardzerver, visible in cardz-studio immediately
+- **API-first**: All DB operations go through cardzerver REST API
 
 ## Cross-Project Sync (cardzerver ecosystem)
 
@@ -114,7 +114,7 @@ obo-gen delete a3b2c1d4         # Delete by ID prefix
 - `~/obo-ios` — SwiftUI iOS flashcard app (consumes `/api/v1/flashcards`)
 - `~/alities-mobile` — SwiftUI iOS trivia app (consumes `/api/v1/trivia`)
 - `~/qross` — SwiftUI iOS trivia game (consumes `/api/v1/trivia/gamedata`)
-- `~/cardz-studio` — React web UI for content management (port 9850)
+- ~~`~/cardz-studio` — React web UI for content management (retired 2026-03-04)~~
 
 | Change | Action |
 |--------|--------|
