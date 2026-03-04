@@ -1,10 +1,11 @@
 # obo-gen
 
-CLI content generator for the cardzerver ecosystem. Uses GPT-4o-mini or Claude Haiku to generate flashcard and trivia decks, saving them via the cardzerver API.
+CLI content generator for the cardzerver ecosystem. Uses GPT-4o-mini, Claude Haiku, or Apple's on-device model to generate flashcard and trivia decks, saving them via the cardzerver API.
 
 ## Stack
-- Swift 5.9+, macOS 13+
-- swift-argument-parser (CLI subcommands)
+- Swift 6.2, macOS 26+
+- swift-argument-parser (AsyncParsableCommand subcommands)
+- FoundationModels (Apple Intelligence on-device ~3B LLM)
 - Foundation URLSession (OpenAI, Anthropic, and cardzerver APIs)
 - No database driver — all DB operations go through cardzerver's REST API
 - Package manager: Swift Package Manager
@@ -32,12 +33,20 @@ obo-gen batch <file> [options]         # Bulk generate from topics file
 | `-a, --age <range>` | Target age range | `8-10` |
 | `-n, --count <N>` | Number of cards | `20` |
 | `-k, --kind <kind>` | `flashcard` or `trivia` | `flashcard` |
-| `-m, --model <model>` | `gpt` (GPT-4o-mini) or `claude` (Haiku 4.5) | `gpt` |
+| `-m, --model <model>` | `gpt`, `claude`, or `onboard` (see Models below) | `gpt` |
 | `-d, --difficulty <level>` | `easy`, `medium`, or `hard` | unset |
 | `-o, --output <path>` | Output file path | stdout |
 | `--voice <hint>` | Append voice hint line | — |
 | `--no-save` | Skip saving to cardzerver | `false` |
 | `--force` | Create even if duplicate title exists | `false` |
+
+### Models
+
+| Model | Flag | API Key | Cost | Notes |
+|-------|------|---------|------|-------|
+| GPT-4o-mini | `--model gpt` | `OPENAI_API_KEY` | Pay per token | Default, cloud |
+| Claude Haiku 4.5 | `--model claude` | `ANTHROPIC_API_KEY` | Pay per token | Cloud |
+| Apple Intelligence | `--model onboard` | None | Free | On-device ~3B LLM, requires macOS 26 with Apple Intelligence enabled |
 
 ### Examples
 
@@ -48,12 +57,15 @@ obo-gen "Solar System" -n 30 --age 6-8
 # Trivia deck via Claude Haiku
 obo-gen "US Presidents" -n 20 --kind trivia --model claude
 
+# Free on-device generation (no API key needed)
+obo-gen "Volcanoes" -n 10 --kind trivia --model onboard
+
 # Hard difficulty, save to file only
 obo-gen "Quantum Physics" --difficulty hard --no-save -o ~/decks/quantum.txt
 
 # Batch generate from file
 echo "Solar System\nUS Presidents\nAncient Rome" > topics.txt
-obo-gen batch topics.txt --kind trivia --model claude -n 15
+obo-gen batch topics.txt --kind trivia --model onboard -n 15
 
 # Database operations (via cardzerver API)
 obo-gen list                    # All decks
@@ -82,7 +94,7 @@ obo-gen delete a3b2c1d4         # Delete by ID prefix
   - `DELETE /api/v1/studio/decks/{id}` — delete deck
   - `GET /api/v1/studio/stats` — database statistics
   - `GET /api/v1/studio/check-duplicate` — duplicate title check
-- AI generation via OpenAI (GPT-4o-mini) or Anthropic (Claude Haiku 4.5)
+- AI generation via OpenAI (GPT-4o-mini), Anthropic (Claude Haiku 4.5), or Apple FoundationModels (on-device)
 - Flashcard format: `Title:` header + `Q: ... | A: ...` lines
 - Trivia format: `Title:` header + `Q:` + `A-D)` choices + `ANSWER:` letter
 - Installed to `~/bin/obo-gen` for global PATH availability
@@ -92,7 +104,7 @@ obo-gen delete a3b2c1d4         # Delete by ID prefix
 - **Duplicate detection**: Warns if a deck with the same title+kind exists (use `--force` to override)
 - **Batch mode**: Generate many decks from a topics file (one per line, `#` comments supported)
 - **Difficulty tagging**: `--difficulty easy/medium/hard` stored in deck + card properties
-- **Two AI models**: GPT-4o-mini (fast, cheap) and Claude Haiku 4.5 (alternative)
+- **Three AI models**: GPT-4o-mini (cloud), Claude Haiku 4.5 (cloud), Apple Intelligence (free, on-device)
 - **API-first**: All DB operations go through cardzerver, visible in cardz-studio immediately
 
 ## Cross-Project Sync (cardzerver ecosystem)
