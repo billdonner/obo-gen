@@ -351,6 +351,7 @@ func parseFlashcardDeck(from content: String) -> ParsedDeck {
     let lines = content.components(separatedBy: "\n")
     var title = ""
     var cards: [Card] = []
+    var pendingQ = ""
 
     for line in lines {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -358,6 +359,7 @@ func parseFlashcardDeck(from content: String) -> ParsedDeck {
             title = trimmed.replacingOccurrences(of: "Title:", with: "").trimmingCharacters(in: .whitespaces)
             continue
         }
+        // Format 1: "Q: question | A: answer" (single line)
         if trimmed.hasPrefix("Q:") && trimmed.contains("| A:") {
             let parts = trimmed.components(separatedBy: "| A:")
             guard parts.count >= 2 else { continue }
@@ -366,6 +368,21 @@ func parseFlashcardDeck(from content: String) -> ParsedDeck {
             if !q.isEmpty && !a.isEmpty {
                 cards.append(Card(question: q, answer: a, choices: nil, correctIndex: nil))
             }
+            pendingQ = ""
+            continue
+        }
+        // Format 2: "Q: question" on one line, "A: answer" on next (onboard model style)
+        if trimmed.hasPrefix("Q:") {
+            pendingQ = trimmed.replacingOccurrences(of: "Q:", with: "").trimmingCharacters(in: .whitespaces)
+            continue
+        }
+        if trimmed.hasPrefix("A:") && !pendingQ.isEmpty {
+            let a = trimmed.replacingOccurrences(of: "A:", with: "").trimmingCharacters(in: .whitespaces)
+            if !a.isEmpty {
+                cards.append(Card(question: pendingQ, answer: a, choices: nil, correctIndex: nil))
+            }
+            pendingQ = ""
+            continue
         }
     }
     return ParsedDeck(title: title.isEmpty ? "Untitled" : title, cards: cards)
