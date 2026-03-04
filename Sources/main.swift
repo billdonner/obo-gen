@@ -1,8 +1,4 @@
 import Foundation
-import PostgresNIO
-import Logging
-import NIOCore
-import NIOPosix
 import ArgumentParser
 
 // MARK: - Shared Types
@@ -26,9 +22,8 @@ enum AIModel: String, CaseIterable, ExpressibleByArgument {
 struct Card {
     let question: String
     let answer: String
-    let choices: [String]?       // trivia only
-    let correctIndex: Int?       // trivia only
-    let difficulty: Difficulty?
+    let choices: [String]?
+    let correctIndex: Int?
 }
 
 struct ParsedDeck {
@@ -36,68 +31,139 @@ struct ParsedDeck {
     let cards: [Card]
 }
 
-// MARK: - Database Config
+// MARK: - Errors
 
-struct DBConfig {
-    let host: String
-    let port: Int
-    let username: String
-    let password: String
-    let database: String
-}
+enum OboGenError: LocalizedError {
+    case apiError(String)
+    case missingKey(String)
+    case serverError(Int, String)
+    case notFound(String)
+    case duplicateExists(String, String)
 
-func loadDBConfig() -> DBConfig {
-    let env = ProcessInfo.processInfo.environment
-    let host = env["CE_DB_HOST"] ?? env["OBO_DB_HOST"] ?? "localhost"
-    let port = Int(env["CE_DB_PORT"] ?? env["OBO_DB_PORT"] ?? "") ?? 5432
-    let username = env["CE_DB_USER"] ?? env["OBO_DB_USER"] ?? "postgres"
-    let password = env["CE_DB_PASSWORD"] ?? env["OBO_DB_PASSWORD"] ?? "postgres"
-    let database = env["CE_DB_NAME"] ?? env["OBO_DB_NAME"] ?? "card_engine"
-    return DBConfig(host: host, port: port, username: username, password: password, database: database)
-}
-
-func makeConnection(dbConfig: DBConfig, eventLoop: any EventLoopGroup) async throws -> PostgresConnection {
-    var logger = Logger(label: "obo-gen")
-    logger.logLevel = .error
-    let config = PostgresConnection.Configuration(
-        host: dbConfig.host, port: dbConfig.port,
-        username: dbConfig.username, password: dbConfig.password,
-        database: dbConfig.database, tls: .disable
-    )
-    let maxAttempts = 3
-    var lastError: Error?
-    for attempt in 1...maxAttempts {
-        do {
-            return try await PostgresConnection.connect(
-                on: eventLoop.next(), configuration: config, id: 1, logger: logger
-            )
-        } catch {
-            lastError = error
-            if attempt < maxAttempts {
-                let delay = UInt64(1 << (attempt - 1))
-                fputs("DB connection attempt \(attempt)/\(maxAttempts) failed, retrying in \(delay)s...\n", stderr)
-                try await Task.sleep(nanoseconds: delay * 1_000_000_000)
-            }
+    var errorDescription: String? {
+        switch self {
+        case .apiError(let msg): return msg
+        case .missingKey(let key): return "\(key) environment variable is not set"
+        case .serverError(let code, let msg): return "Server error (\(code)): \(msg)"
+        case .notFound(let msg): return msg
+        case .duplicateExists(let title, let id): return "Deck '\(title)' already exists (id: \(id)). Use --force to create anyway."
         }
     }
-    throw lastError!
 }
 
-func withDB<T: Sendable>(_ body: @Sendable (PostgresConnection) async throws -> T) async throws -> T {
-    let dbConfig = loadDBConfig()
-    let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    let conn = try await makeConnection(dbConfig: dbConfig, eventLoop: eventLoopGroup)
-    let result: T
-    do {
-        result = try await body(conn)
-    } catch {
-        try? await conn.close()
-        try? eventLoopGroup.syncShutdownGracefully()
-        throw error
+// MARK: - Cardzerver API Client
+
+struct CardzerverClient {
+    let baseURL: String
+
+    init() {
+        let env = ProcessInfo.processInfo.environment
+        self.baseURL = env["CARDZERVER_URL"] ?? "https://bd-cardzerver.fly.dev"
     }
-    try? await conn.close()
-    try? eventLoopGroup.syncShutdownGracefully()
-    return result
+
+    // POST /api/v1/studio/decks/bulk — create deck + cards in one call
+    func createDeckWithCards(
+        title: String, kind: CardKind, properties: [String: Any], cards: [[String: Any]]
+    ) async throws -> (deckId: String, cardCount: Int) {
+        let body: [String: Any] = [
+            "title": title,
+            "kind": kind.rawValue,
+            "properties": properties,
+            "cards": cards,
+        ]
+        let data = try await post(path: "/api/v1/studio/decks/bulk", body: body)
+        let json = try parseJSON(data)
+        guard let id = json["id"] as? String else {
+            throw OboGenError.serverError(0, "Missing id in response")
+        }
+        let cardCount = (json["cards"] as? [[String: Any]])?.count
+            ?? json["card_count"] as? Int ?? 0
+        return (id, cardCount)
+    }
+
+    // GET /api/v1/decks — list decks
+    func listDecks(kind: CardKind?) async throws -> [[String: Any]] {
+        var path = "/api/v1/decks?limit=200"
+        if let kind = kind { path += "&kind=\(kind.rawValue)" }
+        let data = try await get(path: path)
+        let json = try parseJSON(data)
+        return json["decks"] as? [[String: Any]] ?? []
+    }
+
+    // GET /api/v1/decks/{id} — get deck with cards
+    func getDeck(id: String) async throws -> [String: Any] {
+        let data = try await get(path: "/api/v1/decks/\(id)")
+        return try parseJSON(data)
+    }
+
+    // DELETE /api/v1/studio/decks/{id}
+    func deleteDeck(id: String) async throws {
+        let url = URL(string: "\(baseURL)/api/v1/studio/decks/\(id)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try checkResponse(response, data: data)
+    }
+
+    // GET /api/v1/studio/stats
+    func stats() async throws -> [String: Any] {
+        let data = try await get(path: "/api/v1/studio/stats")
+        return try parseJSON(data)
+    }
+
+    // GET /api/v1/studio/check-duplicate?title=X&kind=Y
+    func checkDuplicate(title: String, kind: CardKind) async throws -> (exists: Bool, id: String?) {
+        let encoded = title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? title
+        let data = try await get(path: "/api/v1/studio/check-duplicate?title=\(encoded)&kind=\(kind.rawValue)")
+        let json = try parseJSON(data)
+        let exists = json["exists"] as? Bool ?? false
+        let id = json["id"] as? String
+        return (exists, id)
+    }
+
+    // MARK: Helpers
+
+    private func get(path: String) async throws -> Data {
+        let url = URL(string: "\(baseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try checkResponse(response, data: data)
+        return data
+    }
+
+    private func post(path: String, body: [String: Any]) async throws -> Data {
+        let url = URL(string: "\(baseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try checkResponse(response, data: data)
+        return data
+    }
+
+    private func checkResponse(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw OboGenError.apiError("Invalid response")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            if http.statusCode == 404 {
+                throw OboGenError.notFound("Not found")
+            }
+            throw OboGenError.serverError(http.statusCode, body)
+        }
+    }
+
+    private func parseJSON(_ data: Data) throws -> [String: Any] {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw OboGenError.apiError("Invalid JSON response")
+        }
+        return json
+    }
 }
 
 // MARK: - AI API Calls
@@ -107,7 +173,6 @@ struct ChatMessage: Codable {
     let content: String
 }
 
-// OpenAI
 struct OpenAIChatRequest: Codable {
     let model: String
     let messages: [ChatMessage]
@@ -127,7 +192,6 @@ struct OpenAIErrorResponse: Codable {
     let error: ErrorDetail
 }
 
-// Claude (Anthropic Messages API)
 struct ClaudeRequest: Codable {
     let model: String
     let max_tokens: Int
@@ -286,7 +350,7 @@ func parseFlashcardDeck(from content: String) -> ParsedDeck {
             let q = parts[0].replacingOccurrences(of: "Q:", with: "").trimmingCharacters(in: .whitespaces)
             let a = parts.dropFirst().joined(separator: "| A:").trimmingCharacters(in: .whitespaces)
             if !q.isEmpty && !a.isEmpty {
-                cards.append(Card(question: q, answer: a, choices: nil, correctIndex: nil, difficulty: nil))
+                cards.append(Card(question: q, answer: a, choices: nil, correctIndex: nil))
             }
         }
     }
@@ -297,7 +361,6 @@ func parseTriviaDeck(from content: String) -> ParsedDeck {
     let lines = content.components(separatedBy: "\n")
     var title = ""
     var cards: [Card] = []
-
     var currentQ = ""
     var choices: [String] = []
 
@@ -308,13 +371,10 @@ func parseTriviaDeck(from content: String) -> ParsedDeck {
             continue
         }
         if trimmed.hasPrefix("Q:") {
-            // Save previous question if we have one pending
-            // (shouldn't happen unless ANSWER: was missing)
             currentQ = trimmed.replacingOccurrences(of: "Q:", with: "").trimmingCharacters(in: .whitespaces)
             choices = []
             continue
         }
-        // Match choice lines: A) ..., B) ..., C) ..., D) ...
         if let firstChar = trimmed.first, "ABCD".contains(firstChar),
            trimmed.count > 2 && trimmed.dropFirst(1).hasPrefix(")") {
             let choiceText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
@@ -327,274 +387,24 @@ func parseTriviaDeck(from content: String) -> ParsedDeck {
             let idx = ["A": 0, "B": 1, "C": 2, "D": 3][letter] ?? 0
             if !currentQ.isEmpty && choices.count == 4 {
                 let correctAnswer = choices[idx]
-                cards.append(Card(
-                    question: currentQ, answer: correctAnswer,
-                    choices: choices, correctIndex: idx, difficulty: nil
-                ))
+                cards.append(Card(question: currentQ, answer: correctAnswer, choices: choices, correctIndex: idx))
             }
             currentQ = ""
             choices = []
-            continue
         }
     }
     return ParsedDeck(title: title.isEmpty ? "Untitled" : title, cards: cards)
 }
 
-// MARK: - Database Operations
+// MARK: - Build API card dicts from parsed cards
 
-func checkDuplicate(conn: PostgresConnection, title: String, kind: CardKind) async throws -> String? {
-    let logger = Logger(label: "obo-gen")
-    let query: PostgresQuery =
-        "SELECT id::text FROM decks WHERE LOWER(title) = LOWER(\(title)) AND kind = \(kind.rawValue) LIMIT 1"
-    let rows = try await conn.query(query, logger: logger)
-    for try await row in rows {
-        return try row.decode(String.self)
-    }
-    return nil
-}
-
-func saveDeck(conn: PostgresConnection, parsed: ParsedDeck, kind: CardKind, age: String, voice: String?, difficulty: Difficulty?) async throws -> String {
-    let logger = Logger(label: "obo-gen")
-
-    var propsDict: [String: Any] = ["age_range": age]
-    if let voice = voice { propsDict["voice"] = voice }
-    if let diff = difficulty { propsDict["difficulty"] = diff.rawValue }
-    let propsData = try JSONSerialization.data(withJSONObject: propsDict)
-    let propsJSON = String(data: propsData, encoding: .utf8) ?? "{}"
-
-    let insertDeckQuery: PostgresQuery =
-        "INSERT INTO decks (title, kind, properties) VALUES (\(parsed.title), \(kind.rawValue), \(propsJSON)::jsonb) RETURNING id::text"
-    let deckRows = try await conn.query(insertDeckQuery, logger: logger)
-
-    var deckId = ""
-    for try await row in deckRows {
-        deckId = try row.decode(String.self)
-    }
-    guard !deckId.isEmpty else {
-        throw OboGenError.dbError("Failed to insert deck")
-    }
-
-    for (i, card) in parsed.cards.enumerated() {
-        var cardProps: [String: Any] = ["answer": card.answer]
-        if let choices = card.choices {
-            cardProps["choices"] = choices
-        }
-        if let idx = card.correctIndex {
-            cardProps["correct"] = idx
-        }
-        if let diff = difficulty {
-            cardProps["difficulty"] = diff.rawValue
-        }
-        let cardPropsData = try JSONSerialization.data(withJSONObject: cardProps)
-        let cardPropsJSON = String(data: cardPropsData, encoding: .utf8) ?? "{}"
-        let insertCardQuery: PostgresQuery =
-            "INSERT INTO cards (deck_id, position, question, properties) VALUES (\(deckId)::uuid, \(i + 1), \(card.question), \(cardPropsJSON)::jsonb)"
-        try await conn.query(insertCardQuery, logger: logger)
-    }
-
-    return deckId
-}
-
-func listDecks(conn: PostgresConnection, kind: CardKind?) async throws {
-    let logger = Logger(label: "obo-gen")
-    let listQuery: PostgresQuery
-    if let kind = kind {
-        listQuery = """
-            SELECT id::text, title, kind, COALESCE(properties->>'age_range', ''), card_count, created_at::text
-            FROM decks WHERE kind = \(kind.rawValue) ORDER BY created_at
-            """
-    } else {
-        listQuery = """
-            SELECT id::text, title, kind, COALESCE(properties->>'age_range', ''), card_count, created_at::text
-            FROM decks ORDER BY created_at
-            """
-    }
-    let rows = try await conn.query(listQuery, logger: logger)
-
-    var decks: [(String, String, String, String, Int, String)] = []
-    for try await row in rows {
-        let (id, title, rkind, ageRange, cardCount, createdAt) = try row.decode((String, String, String, String, Int, String).self)
-        decks.append((id, title, rkind, ageRange, cardCount, createdAt))
-    }
-
-    if decks.isEmpty {
-        print("No saved decks.")
-        return
-    }
-
-    func pad(_ s: String, _ width: Int) -> String {
-        s.count >= width ? String(s.prefix(width)) : s + String(repeating: " ", count: width - s.count)
-    }
-    func rpad(_ s: String, _ width: Int) -> String {
-        s.count >= width ? String(s.prefix(width)) : String(repeating: " ", count: width - s.count) + s
-    }
-    print("\(pad("ID", 10))  \(pad("Kind", 10))  \(pad("Topic", 30))  \(pad("Ages", 8))  \(rpad("Cards", 5))  \(pad("Created", 20))")
-    print(String(repeating: "-", count: 91))
-    for (id, topic, rkind, age, count, date) in decks {
-        let truncTopic = topic.count > 30 ? String(topic.prefix(27)) + "..." : topic
-        let shortId = String(id.prefix(8))
-        let shortDate = String(date.prefix(16))
-        print("\(pad(shortId, 10))  \(pad(rkind, 10))  \(pad(truncTopic, 30))  \(pad(age, 8))  \(rpad(String(count), 5))  \(pad(shortDate, 20))")
-    }
-}
-
-func exportDeck(conn: PostgresConnection, deckIdPrefix: String) async throws {
-    let logger = Logger(label: "obo-gen")
-
-    let fetchDeckQuery: PostgresQuery =
-        "SELECT id::text, title, kind, properties->>'voice' FROM decks WHERE id::text LIKE \(deckIdPrefix + "%") LIMIT 1"
-    let deckRows = try await conn.query(fetchDeckQuery, logger: logger)
-
-    var deckId = ""
-    var title = ""
-    var kind = ""
-    var voice: String? = nil
-    var found = false
-    for try await row in deckRows {
-        let data = try row.decode((String, String, String, String?).self)
-        deckId = data.0; title = data.1; kind = data.2; voice = data.3
-        found = true
-    }
-    guard found else {
-        throw OboGenError.notFound("No deck matching '\(deckIdPrefix)'")
-    }
-
-    let fetchCardsQuery: PostgresQuery =
-        "SELECT question, COALESCE(properties->>'answer', ''), COALESCE(properties::text, '{}') FROM cards WHERE deck_id = \(deckId)::uuid ORDER BY position"
-    let cardRows = try await conn.query(fetchCardsQuery, logger: logger)
-
-    var output = "Title: \(title)\nKind: \(kind)\n\n"
-
-    if kind == "trivia" {
-        for try await row in cardRows {
-            let (q, _, propsStr) = try row.decode((String, String, String).self)
-            output += "Q: \(q)\n"
-            if let propsData = propsStr.data(using: .utf8),
-               let props = try? JSONSerialization.jsonObject(with: propsData) as? [String: Any],
-               let choices = props["choices"] as? [String],
-               let correct = props["correct"] as? Int {
-                let letters = ["A", "B", "C", "D"]
-                for (i, choice) in choices.enumerated() {
-                    output += "\(letters[i])) \(choice)\n"
-                }
-                output += "ANSWER: \(letters[correct])\n\n"
-            }
-        }
-    } else {
-        for try await row in cardRows {
-            let (q, a, _) = try row.decode((String, String, String).self)
-            output += "Q: \(q) | A: \(a)\n"
-        }
-    }
-
-    if let voice = voice {
-        output += "\nVoice: \(voice)\n"
-    }
-    print(output, terminator: "")
-}
-
-func deleteDeck(conn: PostgresConnection, deckIdPrefix: String) async throws -> (String, String, Int) {
-    let logger = Logger(label: "obo-gen")
-
-    // Find the deck first
-    let findQuery: PostgresQuery =
-        "SELECT id::text, title, card_count FROM decks WHERE id::text LIKE \(deckIdPrefix + "%") LIMIT 1"
-    let rows = try await conn.query(findQuery, logger: logger)
-
-    var deckId = ""
-    var title = ""
-    var cardCount = 0
-    var found = false
-    for try await row in rows {
-        let data = try row.decode((String, String, Int).self)
-        deckId = data.0; title = data.1; cardCount = data.2
-        found = true
-    }
-    guard found else {
-        throw OboGenError.notFound("No deck matching '\(deckIdPrefix)'")
-    }
-
-    // Cards cascade-delete via FK
-    let deleteQuery: PostgresQuery = "DELETE FROM decks WHERE id = \(deckId)::uuid"
-    try await conn.query(deleteQuery, logger: logger)
-
-    return (deckId, title, cardCount)
-}
-
-func showStats(conn: PostgresConnection) async throws {
-    let logger = Logger(label: "obo-gen")
-
-    // Total decks and cards by kind
-    let summaryQuery: PostgresQuery = """
-        SELECT kind, COUNT(*)::int, COALESCE(SUM(card_count), 0)::int
-        FROM decks GROUP BY kind ORDER BY kind
-        """
-    let rows = try await conn.query(summaryQuery, logger: logger)
-
-    var totalDecks = 0
-    var totalCards = 0
-    var kindRows: [(String, Int, Int)] = []
-    for try await row in rows {
-        let (kind, deckCount, cardCount) = try row.decode((String, Int, Int).self)
-        kindRows.append((kind, deckCount, cardCount))
-        totalDecks += deckCount
-        totalCards += cardCount
-    }
-
-    print("Database: \(loadDBConfig().database) @ \(loadDBConfig().host)")
-    print("Total: \(totalDecks) decks, \(totalCards) cards\n")
-
-    if kindRows.isEmpty {
-        print("No decks found.")
-        return
-    }
-
-    func pad(_ s: String, _ w: Int) -> String {
-        s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
-    }
-    func rpad(_ s: String, _ w: Int) -> String {
-        s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
-    }
-
-    print("\(pad("Kind", 12))  \(rpad("Decks", 6))  \(rpad("Cards", 6))")
-    print(String(repeating: "-", count: 28))
-    for (kind, dc, cc) in kindRows {
-        print("\(pad(kind, 12))  \(rpad(String(dc), 6))  \(rpad(String(cc), 6))")
-    }
-
-    // Age range breakdown
-    let ageQuery: PostgresQuery = """
-        SELECT COALESCE(properties->>'age_range', 'unset'), COUNT(*)::int
-        FROM decks GROUP BY 1 ORDER BY 1
-        """
-    let ageRows = try await conn.query(ageQuery, logger: logger)
-    print("\n\(pad("Age Range", 12))  \(rpad("Decks", 6))")
-    print(String(repeating: "-", count: 20))
-    for try await row in ageRows {
-        let (age, count) = try row.decode((String, Int).self)
-        print("\(pad(age, 12))  \(rpad(String(count), 6))")
-    }
-}
-
-// MARK: - Errors
-
-enum OboGenError: LocalizedError {
-    case apiError(String)
-    case missingKey(String)
-    case dbError(String)
-    case notFound(String)
-    case duplicateExists(String, String)
-    case parseError(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .apiError(let msg): return msg
-        case .missingKey(let key): return "\(key) environment variable is not set"
-        case .dbError(let msg): return msg
-        case .notFound(let msg): return msg
-        case .duplicateExists(let title, let id): return "Deck '\(title)' already exists (id: \(id)). Use --force to create anyway."
-        case .parseError(let msg): return msg
-        }
+func buildCardDicts(cards: [Card], kind: CardKind, difficulty: Difficulty?) -> [[String: Any]] {
+    cards.enumerated().map { (_, card) in
+        var props: [String: Any] = ["answer": card.answer]
+        if let choices = card.choices { props["choices"] = choices }
+        if let idx = card.correctIndex { props["correct_index"] = idx }
+        let diff = difficulty?.rawValue ?? "medium"
+        return ["question": card.question, "properties": props, "difficulty": diff] as [String: Any]
     }
 }
 
@@ -636,7 +446,7 @@ struct Generate: ParsableCommand {
     @Option(name: .shortAndLong, help: "Difficulty level: easy, medium, hard")
     var difficulty: Difficulty? = nil
 
-    @Flag(help: "Skip saving to database")
+    @Flag(help: "Skip saving to cardzerver")
     var noSave: Bool = false
 
     @Flag(help: "Create even if a deck with the same title exists")
@@ -645,14 +455,9 @@ struct Generate: ParsableCommand {
     func run() throws {
         let semaphore = DispatchSemaphore(value: 0)
         var exitCode: Int32 = 0
-
         Task {
-            do {
-                try await runAsync()
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
-            }
+            do { try await runAsync() }
+            catch { fputs("Error: \(error.localizedDescription)\n", stderr); exitCode = 1 }
             semaphore.signal()
         }
         semaphore.wait()
@@ -660,56 +465,50 @@ struct Generate: ParsableCommand {
     }
 
     func runAsync() async throws {
+        let client = CardzerverClient()
+
         // Duplicate check
         if !noSave && !force {
-            if let existingId = try? await withDB({ conn in
-                try await checkDuplicate(conn: conn, title: topic, kind: kind)
-            }) {
-                throw OboGenError.duplicateExists(topic, existingId)
+            let (exists, existingId) = try await client.checkDuplicate(title: topic, kind: kind)
+            if exists, let eid = existingId {
+                throw OboGenError.duplicateExists(topic, eid)
             }
         }
 
         let prompts: (system: String, user: String)
         switch kind {
-        case .flashcard:
-            prompts = buildFlashcardPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
-        case .trivia:
-            prompts = buildTriviaPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
+        case .flashcard: prompts = buildFlashcardPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
+        case .trivia: prompts = buildTriviaPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
         }
 
         fputs("Generating \(count) \(kind.rawValue) cards about \"\(topic)\" for ages \(age) via \(model.rawValue)...\n", stderr)
 
         var content = try await callAI(model: model, systemPrompt: prompts.system, userPrompt: prompts.user)
 
-        if let voice = voice {
-            content += "\n\nVoice: \(voice)"
-        }
+        if let voice = voice { content += "\n\nVoice: \(voice)" }
         if !content.hasSuffix("\n") { content += "\n" }
 
-        // Parse
         let parsed: ParsedDeck
         switch kind {
-        case .flashcard:
-            parsed = parseFlashcardDeck(from: content)
-        case .trivia:
-            parsed = parseTriviaDeck(from: content)
+        case .flashcard: parsed = parseFlashcardDeck(from: content)
+        case .trivia: parsed = parseTriviaDeck(from: content)
         }
-
         fputs("Parsed \(parsed.cards.count) cards\n", stderr)
 
-        // Save to database
+        // Save to cardzerver
         if !noSave {
             if parsed.cards.isEmpty {
-                fputs("Warning: no cards parsed, skipping DB save\n", stderr)
+                fputs("Warning: no cards parsed, skipping save\n", stderr)
             } else {
-                do {
-                    let deckId = try await withDB { conn in
-                        try await saveDeck(conn: conn, parsed: parsed, kind: kind, age: age, voice: voice, difficulty: difficulty)
-                    }
-                    fputs("Saved deck \(String(deckId.prefix(8))) (\(parsed.cards.count) cards) to database\n", stderr)
-                } catch {
-                    fputs("Warning: failed to save to database: \(error.localizedDescription)\n", stderr)
-                }
+                var props: [String: Any] = ["age_range": age]
+                if let voice = voice { props["voice"] = voice }
+                if let diff = difficulty { props["difficulty"] = diff.rawValue }
+                let cardDicts = buildCardDicts(cards: parsed.cards, kind: kind, difficulty: difficulty)
+
+                let (deckId, cardCount) = try await client.createDeckWithCards(
+                    title: parsed.title, kind: kind, properties: props, cards: cardDicts
+                )
+                fputs("Saved deck \(String(deckId.prefix(8))) (\(cardCount) cards) to cardzerver\n", stderr)
             }
         }
 
@@ -737,8 +536,33 @@ struct List: ParsableCommand {
         var exitCode: Int32 = 0
         Task {
             do {
-                try await withDB { conn in
-                    try await listDecks(conn: conn, kind: kind)
+                let client = CardzerverClient()
+                let decks = try await client.listDecks(kind: kind)
+
+                if decks.isEmpty {
+                    print("No saved decks.")
+                    semaphore.signal()
+                    return
+                }
+
+                func pad(_ s: String, _ w: Int) -> String {
+                    s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
+                }
+                func rpad(_ s: String, _ w: Int) -> String {
+                    s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
+                }
+                print("\(pad("ID", 10))  \(pad("Kind", 10))  \(pad("Topic", 30))  \(rpad("Cards", 5))  \(pad("Created", 20))")
+                print(String(repeating: "-", count: 81))
+                for deck in decks {
+                    let id = (deck["id"] as? String) ?? "?"
+                    let title = (deck["title"] as? String) ?? "?"
+                    let kind = (deck["kind"] as? String) ?? "?"
+                    let cardCount = (deck["card_count"] as? Int) ?? 0
+                    let created = (deck["created_at"] as? String) ?? "?"
+                    let shortId = String(id.prefix(8))
+                    let truncTitle = title.count > 30 ? String(title.prefix(27)) + "..." : title
+                    let shortDate = String(created.prefix(16))
+                    print("\(pad(shortId, 10))  \(pad(kind, 10))  \(pad(truncTitle, 30))  \(rpad(String(cardCount), 5))  \(pad(shortDate, 20))")
                 }
             } catch {
                 fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -762,9 +586,56 @@ struct Export: ParsableCommand {
         var exitCode: Int32 = 0
         Task {
             do {
-                try await withDB { conn in
-                    try await exportDeck(conn: conn, deckIdPrefix: id)
+                let client = CardzerverClient()
+
+                // If prefix, find the full ID first
+                var fullId = id
+                if id.count < 36 {
+                    let decks = try await client.listDecks(kind: nil)
+                    guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
+                        throw OboGenError.notFound("No deck matching '\(id)'")
+                    }
+                    fullId = match["id"] as? String ?? id
                 }
+
+                let deck = try await client.getDeck(id: fullId)
+                let title = deck["title"] as? String ?? "Untitled"
+                let kind = deck["kind"] as? String ?? "flashcard"
+                let cards = deck["cards"] as? [[String: Any]] ?? []
+
+                var output = "Title: \(title)\nKind: \(kind)\n\n"
+
+                if kind == "trivia" {
+                    for card in cards {
+                        let q = card["question"] as? String ?? ""
+                        let props = card["properties"] as? [String: Any] ?? [:]
+                        output += "Q: \(q)\n"
+                        if let choices = props["choices"] as? [String],
+                           let correct = props["correct_index"] as? Int {
+                            let letters = ["A", "B", "C", "D"]
+                            for (i, choice) in choices.enumerated() {
+                                output += "\(letters[i])) \(choice)\n"
+                            }
+                            if correct < letters.count {
+                                output += "ANSWER: \(letters[correct])\n"
+                            }
+                        }
+                        output += "\n"
+                    }
+                } else {
+                    for card in cards {
+                        let q = card["question"] as? String ?? ""
+                        let props = card["properties"] as? [String: Any] ?? [:]
+                        let a = props["answer"] as? String ?? ""
+                        output += "Q: \(q) | A: \(a)\n"
+                    }
+                }
+
+                let deckProps = deck["properties"] as? [String: Any] ?? [:]
+                if let voice = deckProps["voice"] as? String {
+                    output += "\nVoice: \(voice)\n"
+                }
+                print(output, terminator: "")
             } catch {
                 fputs("Error: \(error.localizedDescription)\n", stderr)
                 exitCode = 1
@@ -787,10 +658,22 @@ struct Delete: ParsableCommand {
         var exitCode: Int32 = 0
         Task {
             do {
-                let (deckId, title, cardCount) = try await withDB { conn in
-                    try await deleteDeck(conn: conn, deckIdPrefix: id)
+                let client = CardzerverClient()
+
+                // Resolve prefix
+                var fullId = id
+                var title = "?"
+                if id.count < 36 {
+                    let decks = try await client.listDecks(kind: nil)
+                    guard let match = decks.first(where: { ($0["id"] as? String ?? "").hasPrefix(id) }) else {
+                        throw OboGenError.notFound("No deck matching '\(id)'")
+                    }
+                    fullId = match["id"] as? String ?? id
+                    title = match["title"] as? String ?? "?"
                 }
-                print("Deleted deck '\(title)' (\(String(deckId.prefix(8))), \(cardCount) cards)")
+
+                try await client.deleteDeck(id: fullId)
+                print("Deleted deck '\(title)' (\(String(fullId.prefix(8))))")
             } catch {
                 fputs("Error: \(error.localizedDescription)\n", stderr)
                 exitCode = 1
@@ -810,8 +693,41 @@ struct Stats: ParsableCommand {
         var exitCode: Int32 = 0
         Task {
             do {
-                try await withDB { conn in
-                    try await showStats(conn: conn)
+                let client = CardzerverClient()
+                let stats = try await client.stats()
+
+                let totalDecks = stats["total_decks"] as? Int ?? 0
+                let totalCards = stats["total_cards"] as? Int ?? 0
+
+                print("Server: \(client.baseURL)")
+                print("Total: \(totalDecks) decks, \(totalCards) cards\n")
+
+                func pad(_ s: String, _ w: Int) -> String {
+                    s.count >= w ? String(s.prefix(w)) : s + String(repeating: " ", count: w - s.count)
+                }
+                func rpad(_ s: String, _ w: Int) -> String {
+                    s.count >= w ? String(s.prefix(w)) : String(repeating: " ", count: w - s.count) + s
+                }
+
+                if let byKind = stats["by_kind"] as? [[String: Any]], !byKind.isEmpty {
+                    print("\(pad("Kind", 12))  \(rpad("Decks", 6))  \(rpad("Cards", 6))")
+                    print(String(repeating: "-", count: 28))
+                    for entry in byKind {
+                        let kind = entry["kind"] as? String ?? "?"
+                        let decks = entry["decks"] as? Int ?? 0
+                        let cards = entry["cards"] as? Int ?? 0
+                        print("\(pad(kind, 12))  \(rpad(String(decks), 6))  \(rpad(String(cards), 6))")
+                    }
+                }
+
+                if let byAge = stats["by_age_range"] as? [[String: Any]], !byAge.isEmpty {
+                    print("\n\(pad("Age Range", 12))  \(rpad("Decks", 6))")
+                    print(String(repeating: "-", count: 20))
+                    for entry in byAge {
+                        let age = entry["age_range"] as? String ?? "?"
+                        let decks = entry["decks"] as? Int ?? 0
+                        print("\(pad(age, 12))  \(rpad(String(decks), 6))")
+                    }
                 }
             } catch {
                 fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -848,16 +764,15 @@ struct Batch: ParsableCommand {
     @Flag(help: "Create even if duplicate titles exist")
     var force: Bool = false
 
+    @Flag(help: "Skip saving to cardzerver (generate + print only)")
+    var noSave: Bool = false
+
     func run() throws {
         let semaphore = DispatchSemaphore(value: 0)
         var exitCode: Int32 = 0
         Task {
-            do {
-                try await runAsync()
-            } catch {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
-                exitCode = 1
-            }
+            do { try await runAsync() }
+            catch { fputs("Error: \(error.localizedDescription)\n", stderr); exitCode = 1 }
             semaphore.signal()
         }
         semaphore.wait()
@@ -876,6 +791,7 @@ struct Batch: ParsableCommand {
             return
         }
 
+        let client = CardzerverClient()
         fputs("Batch generating \(topics.count) \(kind.rawValue) decks...\n", stderr)
 
         var succeeded = 0
@@ -886,11 +802,10 @@ struct Batch: ParsableCommand {
             fputs("\n[\(i + 1)/\(topics.count)] \(topic)\n", stderr)
 
             // Duplicate check
-            if !force {
-                if let existingId = try? await withDB({ conn in
-                    try await checkDuplicate(conn: conn, title: topic, kind: kind)
-                }) {
-                    fputs("  Skipped (duplicate, id: \(String(existingId.prefix(8))))\n", stderr)
+            if !noSave && !force {
+                let (exists, existingId) = try await client.checkDuplicate(title: topic, kind: kind)
+                if exists {
+                    fputs("  Skipped (duplicate, id: \(String((existingId ?? "?").prefix(8))))\n", stderr)
                     skipped += 1
                     continue
                 }
@@ -899,20 +814,16 @@ struct Batch: ParsableCommand {
             do {
                 let prompts: (system: String, user: String)
                 switch kind {
-                case .flashcard:
-                    prompts = buildFlashcardPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
-                case .trivia:
-                    prompts = buildTriviaPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
+                case .flashcard: prompts = buildFlashcardPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
+                case .trivia: prompts = buildTriviaPrompt(topic: topic, count: count, age: age, difficulty: difficulty)
                 }
 
                 let rawContent = try await callAI(model: model, systemPrompt: prompts.system, userPrompt: prompts.user)
 
                 let parsed: ParsedDeck
                 switch kind {
-                case .flashcard:
-                    parsed = parseFlashcardDeck(from: rawContent)
-                case .trivia:
-                    parsed = parseTriviaDeck(from: rawContent)
+                case .flashcard: parsed = parseFlashcardDeck(from: rawContent)
+                case .trivia: parsed = parseTriviaDeck(from: rawContent)
                 }
 
                 if parsed.cards.isEmpty {
@@ -921,10 +832,19 @@ struct Batch: ParsableCommand {
                     continue
                 }
 
-                let deckId = try await withDB { conn in
-                    try await saveDeck(conn: conn, parsed: parsed, kind: kind, age: age, voice: nil, difficulty: difficulty)
+                if noSave {
+                    fputs("  Generated \(parsed.cards.count) cards (not saved)\n", stderr)
+                    print(rawContent)
+                } else {
+                    var props: [String: Any] = ["age_range": age]
+                    if let diff = difficulty { props["difficulty"] = diff.rawValue }
+                    let cardDicts = buildCardDicts(cards: parsed.cards, kind: kind, difficulty: difficulty)
+
+                    let (deckId, cardCount) = try await client.createDeckWithCards(
+                        title: parsed.title, kind: kind, properties: props, cards: cardDicts
+                    )
+                    fputs("  Saved \(String(deckId.prefix(8))) (\(cardCount) cards)\n", stderr)
                 }
-                fputs("  Saved \(String(deckId.prefix(8))) (\(parsed.cards.count) cards)\n", stderr)
                 succeeded += 1
             } catch {
                 fputs("  Failed: \(error.localizedDescription)\n", stderr)
